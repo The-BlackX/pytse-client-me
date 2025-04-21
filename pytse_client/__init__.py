@@ -5,7 +5,8 @@ from .download import (
     download,
     download_client_types_records,
     download_financial_indexes,
-    option
+    option,
+    download_option_data  # اضافه شده
 )
 from .financial_index import FinancialIndex
 from .stats import get_stats

@@ -1,5 +1,8 @@
 import logging
 import re
+import json
+import os
+import sys
 from concurrent import futures
 from io import StringIO
 from pathlib import Path
@@ -16,14 +19,7 @@ from requests.sessions import Session
 from tenacity import retry, retry_if_exception_type, wait_random
 from tenacity.before_sleep import before_sleep_log
 
-# importهای جدید برای تابع option
-import json
-import os
-
 logger = logging.getLogger(config.LOGGER_NAME)
-
-# مسیر ثابت برای فایل symbols_option.json
-SYMBOLS_OPTION_JSON_PATH = os.path.join(os.path.dirname(__file__), 'data', 'symbols_option.json')
 
 
 def _handle_ticker_index(symbol):
@@ -442,6 +438,146 @@ def download_ticker_client_types_record(ticker_index: Optional[str]):
     return client_types_data_frame
 
 
+def download_option_data(
+    symbols: Union[List, str] = "all",
+    json_path: Optional[str] = None,
+    write_to_csv: bool = False,
+    write_to_excel: bool = False,
+    base_path: str = "option_data",
+    include_jdate: bool = False,
+    adjust: bool = False
+) -> Dict[str, pd.DataFrame]:
+    """
+    Download historical option data for given symbols from a JSON file.
+    
+    Parameters
+    ----------
+    symbols : Union[List, str], optional
+        List of symbols, single symbol, or "all" to download all symbols from JSON (default is "all").
+    json_path : Optional[str], optional
+        Path to symbols_option.json. If None, looks for symbols_option.json next to the executed script.
+    write_to_csv : bool, optional
+        If True, saves data as CSV files in base_path (default is False).
+    write_to_excel : bool, optional
+        If True, saves data as Excel files in base_path (default is False).
+    base_path : str, optional
+        Directory to save CSV/Excel files (default is "option_data").
+    include_jdate : bool, optional
+        If True, includes Persian date column (JDate) (default is False).
+    adjust : bool, optional
+        If True, adjusts prices for capital increase/profit sharing (default is False).
+
+    Returns
+    -------
+    Dict[str, pd.DataFrame]
+        Dictionary mapping symbols to their historical option data DataFrames.
+    """
+    # Determine JSON path (next to executed script if not specified)
+    if json_path is None:
+        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        json_path = os.path.join(script_dir, "symbols_option.json")
+    
+    # Read symbols from JSON
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            symbols_data = json.load(f)
+        all_symbols = [list(item.keys())[0] for item in symbols_data if item]
+        symbol_indices = {list(item.keys())[0]: item[list(item.keys())[0]]["index"] for item in symbols_data if item}
+    except FileNotFoundError:
+        logger.error(f"JSON file not found: {json_path}")
+        return {}
+    except Exception as e:
+        logger.error(f"Error reading JSON file {json_path}: {e}")
+        return {}
+
+    # Handle symbols input
+    if symbols == "all":
+        symbols = all_symbols
+    elif isinstance(symbols, str):
+        symbols = [symbols]
+
+    # Validate symbols
+    valid_symbols = [s for s in symbols if s in all_symbols]
+    if not valid_symbols:
+        logger.error("No valid symbols provided or found in JSON")
+        return {}
+
+    df_list = {}
+    future_to_symbol = {}
+    with futures.ThreadPoolExecutor(max_workers=10) as executor:
+        session = requests_retry_session()
+        for symbol in valid_symbols:
+            ticker_index = symbol_indices.get(symbol)
+            if ticker_index is None:
+                logger.error(f"No index found for symbol: {symbol}")
+                continue
+
+            future = executor.submit(
+                download_ticker_daily_record, ticker_index, session
+            )
+            future_to_symbol[future] = symbol
+
+        for future in futures.as_completed(future_to_symbol):
+            symbol = future_to_symbol[future]
+            try:
+                df: pd.DataFrame = future.result()
+            except pd.errors.EmptyDataError as ex:
+                logger.error(
+                    f"Cannot read daily option records for symbol: {symbol}",
+                    extra={"Error": ex},
+                )
+                continue
+            except Exception as e:
+                logger.error(
+                    f"Error downloading option data for {symbol}: {e}"
+                )
+                continue
+
+            # Process DataFrame
+            df = df.iloc[::-1].reset_index(drop=True)
+            df = df.rename(columns=translations.HISTORY_FIELD_MAPPINGS)
+            df = df.drop(columns=["<PER>", "<TICKER>"], errors="ignore")
+            _adjust_data_frame(df, include_jdate)
+
+            # Rename columns to match desired format
+            df = df.rename(columns={
+                'date': 'Date',
+                'open': 'Open',
+                'high': 'High',
+                'low': 'Low',
+                'close': 'Close',
+                'adjClose': 'Final',
+                'value': 'Value',
+                'volume': 'Volume',
+                'jdate': 'JDate',
+                'yesterday': 'Yesterday',
+                'count': 'Count'
+            })
+            df['Symbol'] = symbol
+            df['Date'] = pd.to_datetime(df['Date']).dt.date
+
+            if adjust:
+                df = adjust_price(df)
+
+            df_list[symbol] = df
+
+            # Save to CSV or Excel
+            if write_to_csv or write_to_excel:
+                Path(base_path).mkdir(parents=True, exist_ok=True)
+                try:
+                    if write_to_csv:
+                        df.to_csv(f"{base_path}/{symbol}.csv", index=False)
+                    if write_to_excel:
+                        df.to_excel(f"{base_path}/{symbol}.xlsx", index=False, engine='openpyxl')
+                except Exception as e:
+                    logger.error(f"Error saving option data for {symbol}: {e}")
+
+    if len(df_list) != len(valid_symbols):
+        print("Warning, option data download did not complete, re-run the code")
+    session.close()
+    return df_list
+
+
 def get_symbol_id(symbol_name: str):
     url = tse_settings.TSE_SYMBOL_ID_URL.format(symbol_name.strip())
     response = requests_retry_session().get(url, timeout=10)
@@ -492,123 +628,3 @@ def get_symbol_info(symbol_name: str):
     if market_symbol.index is None:
         return None
     return market_symbol
-
-
-def option(
-    output_format: Optional[str] = None,
-    only_dataframe: bool = False,
-    base_path: str = config.DATA_BASE_PATH,
-    adjust: bool = False,
-    include_jdate: bool = False
-) -> Dict[str, pd.DataFrame]:
-    """
-    Download historical data for ticker symbols specified in symbols_option.json.
-
-    Args:
-        output_format: Output format for saving data ('csv', 'excel', or None).
-                       If None and only_dataframe is False, no files are saved.
-        only_dataframe: If True, returns DataFrame without saving to files.
-        base_path: Directory to save output files (default: config.DATA_BASE_PATH).
-        adjust: If True, adjust prices for capital increase or dividends.
-        include_jdate: If True, include Persian (Jalali) date column.
-
-    Returns:
-        Dictionary with symbol names as keys and DataFrames as values containing
-        historical data (columns: date, open, high, low, close, adjClose,
-        yesterday, value, volume, count, and jdate if include_jdate=True).
-
-    Raises:
-        FileNotFoundError: If symbols_option.json is not found.
-        ValueError: If output_format is invalid.
-    """
-    # اعتبارسنجی output_format
-    if output_format not in [None, 'csv', 'excel']:
-        raise ValueError("output_format must be 'csv', 'excel', or None")
-
-    # خواندن نمادها از symbols_option.json
-    try:
-        with open(SYMBOLS_OPTION_JSON_PATH, 'r', encoding='utf-8') as f:
-            json_data = json.load(f)
-        symbols = [list(item.keys())[0] for item in json_data if item]
-    except FileNotFoundError:
-        logger.error(f"Cannot find {SYMBOLS_OPTION_JSON_PATH}")
-        raise FileNotFoundError(f"{SYMBOLS_OPTION_JSON_PATH} not found")
-    except Exception as e:
-        logger.error(f"Error reading {SYMBOLS_OPTION_JSON_PATH}: {e}")
-        return {}
-
-    if not symbols:
-        logger.warning("No valid symbols found in symbols_option.json")
-        return {}
-
-    df_list = {}
-    future_to_symbol = {}
-    with futures.ThreadPoolExecutor(max_workers=10) as executor:
-        session = requests_retry_session()
-        for symbol in symbols:
-            ticker_index = _handle_ticker_index(symbol)
-            if ticker_index is None:
-                logger.error(f"Cannot find symbol: {symbol}")
-                continue
-
-            ticker_indexes = symbols_data.get_ticker_old_index(symbol)
-            ticker_indexes.insert(0, ticker_index)
-
-            for index in ticker_indexes:
-                future = executor.submit(
-                    download_ticker_daily_record, index, session
-                )
-                future_to_symbol[future] = symbol
-
-        for future in futures.as_completed(future_to_symbol):
-            symbol = future_to_symbol[future]
-            try:
-                df: pd.DataFrame = future.result()
-            except pd.errors.EmptyDataError as ex:
-                logger.error(
-                    f"Cannot read daily trade records for symbol: {symbol}",
-                    extra={"Error": ex},
-                )
-                continue
-
-            df = df.iloc[::-1].reset_index(drop=True)
-            df = df.rename(columns=translations.HISTORY_FIELD_MAPPINGS)
-            df = df.drop(columns=["<PER>", "<TICKER>"])
-            _adjust_data_frame(df, include_jdate)
-
-            if symbol in df_list:
-                df_list[symbol] = (
-                    pd.concat(
-                        [df_list[symbol], df], ignore_index=True, sort=False
-                    )
-                    .sort_values("date")
-                    .reset_index(drop=True)
-                )
-            else:
-                df_list[symbol] = df
-
-            if adjust:
-                df_list[symbol] = adjust_price(df_list[symbol])
-
-            if not only_dataframe and output_format:
-                Path(base_path).mkdir(parents=True, exist_ok=True)
-                if output_format == 'csv':
-                    file_name = f"{symbol}-ت.csv" if adjust else f"{symbol}.csv"
-                    file_path = os.path.join(base_path, file_name)
-                    df_list[symbol].to_csv(file_path, index=False, encoding='utf-8')
-                    logger.info(f"Saved CSV for {symbol} to {file_path}")
-                elif output_format == 'excel':
-                    try:
-                        import openpyxl
-                    except ImportError:
-                        logger.error("openpyxl not installed. Install it to save Excel files.")
-                        raise ImportError("openpyxl is required for saving Excel files")
-                    file_path = os.path.join(base_path, f"{symbol}.xlsx")
-                    df_list[symbol].to_excel(file_path, index=False, engine='openpyxl')
-                    logger.info(f"Saved Excel for {symbol} to {file_path}")
-
-    if len(df_list) != len(symbols):
-        print("Warning, download did not complete, re-run the code")
-
-    session.close()
-    return df_list
