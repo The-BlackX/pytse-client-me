@@ -1,0 +1,26 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+/dist/
+
+# Environments
+/.idea/
+*/.vscode/
+/.venv/
+/venv/
+/.spyproject/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Project generated files
+/pytse_client/examples/tickers_data/
+*.csv
+.vscode/settings.json
+
+key_stats_data
